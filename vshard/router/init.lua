@@ -1,5 +1,6 @@
 local log = require('log')
 local lfiber = require('fiber')
+local mod_buffer = require('buffer')
 local lmsgpack = require('msgpack')
 local table_new = require('table.new')
 local fiber_clock = lfiber.clock
@@ -984,6 +985,8 @@ local function replicasets_map_reduce(replicasets, rid, func, args, opts)
     assert(opts)
     local timeout = opts.timeout or consts.CALL_TIMEOUT_MIN
     local do_return_raw = opts.return_raw
+    local buffer = opts.buffer
+    local do_skip_header = opts.skip_header
     local deadline = fiber_clock() + timeout
     local opts_map = {is_async = true, return_raw = do_return_raw}
     local futures = {}
@@ -992,17 +995,38 @@ local function replicasets_map_reduce(replicasets, rid, func, args, opts)
     -- Map stage: send.
     --
     args = {'storage_map', rid, func, args}
-    for _, rs in pairs(replicasets) do
-        local res, err = rs:callrw('vshard.storage._call', args, opts_map)
-        if res == nil then
-            return nil, err, rs.id
+    if buffer ~= nil then
+        opts_map.skip_header = do_skip_header
+        for uuid, rs in pairs(replicasets) do
+            map[uuid] = mod_buffer.ibuf()
+            opts_map.buffer = map[uuid]
+            local res, err = rs:callrw('vshard.storage._call', args, opts_map)
+            if res == nil then
+                return nil, err, rs.id
+            end
+            futures[rs.id] = res
         end
-        futures[rs.id] = res
+    else
+        for _, rs in pairs(replicasets) do
+            local res, err = rs:callrw('vshard.storage._call', args, opts_map)
+            if res == nil then
+                return nil, err, rs.id
+            end
+            futures[rs.id] = res
+        end
     end
     --
     -- Map stage: collect.
     --
-    if do_return_raw then
+    if buffer ~= nil then
+        for id, f in pairs(futures) do
+            local res, err = future_wait(f, timeout)
+            if res == nil then
+                return nil, err, id
+            end
+            timeout = deadline - fiber_clock()
+        end
+    elseif do_return_raw then
         for id, f in pairs(futures) do
             local res, err = future_wait(f, timeout)
             if res == nil then
@@ -1107,6 +1131,10 @@ end
 --         into the network anyway.
 --     - bucket_ids - an array of bucket IDs which have to be covered by
 --         Map-Reduce. By default the whole cluster is covered.
+--     - buffer - true/false. When specified, puts result msgpack into IBuf and
+--         ignores 'return_raw' flag.
+--     - skip_header - true/false. It is only used when 'buffer' is set. Otherwise,
+--         it is omitted.
 --
 -- @return In case of success - a map with replicaset ID (UUID or name) keys and
 --     values being what the function returned from the replicaset.
@@ -1118,11 +1146,13 @@ end
 --
 local function router_map_callrw(router, func, args, opts)
     local replicasets_to_map, err, err_id, map, futures, rid
-    local timeout, do_return_raw, bucket_ids
+    local timeout, do_return_raw, bucket_ids, buf, do_skip_header
     if opts then
         timeout = opts.timeout or consts.CALL_TIMEOUT_MIN
         do_return_raw = opts.return_raw
         bucket_ids = opts.bucket_ids
+        buf = opts.buffer
+        do_skip_header = opts.skip_header
     else
         timeout = consts.CALL_TIMEOUT_MIN
     end
@@ -1136,7 +1166,8 @@ local function router_map_callrw(router, func, args, opts)
     if timeout then
         map, err, err_id = replicasets_map_reduce(replicasets_to_map, rid, func,
             args, {
-                timeout = timeout, return_raw = do_return_raw
+                timeout = timeout, return_raw = do_return_raw,
+                buffer = buf, skip_header = do_skip_header
             })
         if map then
             return map

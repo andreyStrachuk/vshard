@@ -525,3 +525,66 @@ g.test_map_all_callrw_raw = function(cg)
         _G.old_do_map = nil
     end)
 end
+
+g.test_map_part_callrw_buf = function(cg)
+    --
+    -- Successful map.
+    --
+    local bid1 = vtest.storage_first_bucket(cg.replica_1_a)
+    local bid2 = vtest.storage_first_bucket(cg.replica_2_a)
+    local res = router_do_map(cg.router, {3}, {
+        timeout = vtest.wait_timeout,
+        buf = true,
+        bucket_ids = {bid1, bid2},
+    })
+    t.assert_equals(res.val, {
+        [cg.rs1_uuid] = {{cg.rs1_uuid, 3}},
+        [cg.rs2_uuid] = {{cg.rs2_uuid, 3}},
+    })
+    t.assert_equals(res.val_type, 'table')
+    t.assert(not res.err)
+    --
+    -- Successful map, but one of the storages returns nothing.
+    --
+    cg.replica_2_a:exec(function()
+        rawset(_G, 'old_do_map', _G.do_map)
+        _G.do_map = function()
+            return
+        end
+    end)
+    res = router_do_map(cg.router, {}, {
+        timeout = vtest.wait_timeout,
+        buf = true,
+        bucket_ids = {bid1, bid2},
+    })
+    t.assert_equals(res.val, {
+        [cg.rs1_uuid] = {{cg.rs1_uuid}},
+    })
+    --
+    -- Error at map stage.
+    --
+    cg.replica_2_a:exec(function()
+        _G.do_map = function()
+            return box.error(box.error.PROC_LUA, "map_err")
+        end
+    end)
+    res = router_do_map(cg.router, {}, {
+        timeout = vtest.wait_timeout,
+        buf = true,
+        bucket_ids = {bid1, bid2},
+    })
+    t.assert_equals(res.val, nil)
+    t.assert_covers(res.err, {
+        code = box.error.PROC_LUA,
+        type = 'ClientError',
+        message = 'map_err'
+    }, 'error object')
+    t.assert_equals(res.err_uuid, cg.rs2_uuid, 'error uuid')
+    --
+    -- Cleanup.
+    --
+    cg.replica_2_a:exec(function()
+        _G.do_map = _G.old_do_map
+        _G.old_do_map = nil
+    end)
+end
